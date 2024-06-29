@@ -22,7 +22,7 @@ abstract class PfSenseAbstract extends \KubernetesController\Plugin\AbstractPlug
             $config->save();
         } catch (\Exception $e) {
             $sectionName = $config->getSectionName();
-            $this->log("failed saving ${sectionName} config: ".$e->getMessage().' ('.$e->getCode().')');
+            $this->log("failed saving {$sectionName} config: ".$e->getMessage().' ('.$e->getCode().')');
             throw $e;
         }
     }
@@ -62,6 +62,39 @@ EOT;
             $this->log('successfully reloaded openbgp service');
         } catch (\Exception $e) {
             $this->log('failed reload openbgp service: '.$e->getMessage().' ('.$e->getCode().')');
+            throw $e;
+        }
+    }
+
+    /**
+     * Reload frr bgp service
+     *
+     * @throws \Exception
+     */
+    protected function reloadFrrBgp()
+    {
+        try {
+            $code = <<<'EOT'
+require_once("/usr/local/pkg/frr.inc");
+frr_generate_config_bgp();
+restart_service_if_running("FRR bgpd");
+
+$messages = null;
+$ok = true;
+
+if($messages == null) {
+	$messages = "";
+}
+
+$toreturn = [
+    'ok' => $ok,
+    'messages' => $messages,
+];
+EOT;
+            $this->pfSenseExecPhp($code);
+            $this->log('successfully reloaded frr bgp service');
+        } catch (\Exception $e) {
+            $this->log('failed reload frr bgp service: '.$e->getMessage().' ('.$e->getCode().')');
             throw $e;
         }
     }
@@ -156,7 +189,7 @@ EOT;
             }
 
             if (!empty($response['messages'])) {
-                $this->log('warnings from HAProxy: '.$response['messages']);
+                $this->log('warnings from HAProxy: '. trim($response['messages']));
             }
 
             $this->log('successfully reloaded HAProxy service');

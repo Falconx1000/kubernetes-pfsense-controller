@@ -8,13 +8,17 @@ namespace KubernetesPfSenseController\Plugin;
  */
 class DNSIngresses extends PfSenseAbstract
 {
+    use CommonTrait;
+    use DNSResourceTrait;
     /**
      * Unique Plugin ID
      */
-    const PLUGIN_ID = 'pfsense-dns-ingresses';
+    public const PLUGIN_ID = 'pfsense-dns-ingresses';
 
-    use CommonTrait;
-    use DNSResourceTrait;
+    /**
+     * Annotation to override default enabled
+     */
+    public const ENABLED_ANNOTATION_NAME = 'dns.pfsense.org/enabled';
 
     /**
      * Init the plugin
@@ -25,13 +29,16 @@ class DNSIngresses extends PfSenseAbstract
     {
         $controller = $this->getController();
         $pluginConfig = $this->getConfig();
-        $ingressLabelSelector = $pluginConfig['serviceLabelSelector'];
-        $ingressFieldSelector = $pluginConfig['serviceFieldSelector'];
+        $ingressLabelSelector = $pluginConfig['serviceLabelSelector'] ?? null;
+        $ingressFieldSelector = $pluginConfig['serviceFieldSelector'] ?? null;
 
         // 1.20 will kill the old version
         // https://kubernetes.io/blog/2019/07/18/api-deprecations-in-1-16/
         $kubernetesMajorMinor = $controller->getKubernetesVersionMajorMinor();
-        if (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.14')) {
+        if (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.19')) {
+            $ingressResourcePath = '/apis/networking.k8s.io/v1/ingresses';
+            $ingressResourceWatchPath = '/apis/networking.k8s.io/v1/watch/ingresses';
+        } elseif (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.14')) {
             $ingressResourcePath = '/apis/networking.k8s.io/v1beta1/ingresses';
             $ingressResourceWatchPath = '/apis/networking.k8s.io/v1beta1/watch/ingresses';
         } else {
@@ -44,7 +51,7 @@ class DNSIngresses extends PfSenseAbstract
             'labelSelector' => $ingressLabelSelector,
             'fieldSelector' => $ingressFieldSelector,
         ];
-        $ingresses = $controller->getKubernetesClient()->request($ingressResourcePath, 'GET', $params);
+        $ingresses = $controller->getKubernetesClient()->createList($ingressResourcePath, $params)->get();
         $this->state['resources'] = $ingresses['items'];
 
         // watch for ingress changes
@@ -97,6 +104,28 @@ class DNSIngresses extends PfSenseAbstract
      */
     public function buildResourceHosts(&$resourceHosts, $ingress)
     {
+        $pluginConfig = $this->getConfig();
+        if (KubernetesUtils::getResourceAnnotationExists($ingress, self::ENABLED_ANNOTATION_NAME)) {
+            $ingressDnsEnabledAnnotationValue = KubernetesUtils::getResourceAnnotationValue($ingress, self::ENABLED_ANNOTATION_NAME);
+            $ingressDnsEnabledAnnotationValue = strtolower($ingressDnsEnabledAnnotationValue);
+
+            if (in_array($ingressDnsEnabledAnnotationValue, ["true", "1"])) {
+                $ingressDnsEnabled = true;
+            } else {
+                $ingressDnsEnabled = false;
+            }
+        } else {
+            if (key_exists('defaultEnabled', $pluginConfig)) {
+                $ingressDnsEnabled = (bool) $pluginConfig['defaultEnabled'];
+            } else {
+                $ingressDnsEnabled = true;
+            }
+        }
+
+        if (!$ingressDnsEnabled) {
+            return;
+        }
+
         $ip = KubernetesUtils::getIngressIp($ingress);
         if (empty($ip)) {
             return;

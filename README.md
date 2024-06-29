@@ -1,3 +1,6 @@
+![Image](https://img.shields.io/docker/pulls/travisghansen/kubernetes-pfsense-controller.svg)
+![Image](https://img.shields.io/github/actions/workflow/status/travisghansen/kubernetes-pfsense-controller/main.yml?branch=master&style=flat-square)
+
 # Intro
 [kubernetes-pfsense-controller (kpc)](https://github.com/travisghansen/kubernetes-pfsense-controller) works hard to keep
 [pfSense](https://www.pfsense.org/) and [Kubernetes](https://kubernetes.io/) in sync and harmony.  The primary focus is
@@ -14,6 +17,39 @@ Disclaimer: this is new software bound to have bugs.  Please make a backup befor
 configuration.  Having said that, all known code paths appear to be solid and working without issue.  If you find a bug,
 please report it! 
 
+Updated disclaimer: this software is no longer very new, but is still bound to have bugs. Continue to make backups as
+appropriate :) Having said that, it's been used for multiple years now on several systems and has yet to do anything
+evil.
+
+# Installation
+
+Various files are available in the `deploy` directory of the project, alter to your needs and `kubectl apply`.
+
+Alternatively, a helm repository is provided for convenience:
+
+```
+helm repo add kubernetes-pfsense-controller https://travisghansen.github.io/kubernetes-pfsense-controller-chart/
+helm repo update
+
+# create your own values.yaml file and edit as appropriate
+# https://github.com/travisghansen/kubernetes-pfsense-controller-chart/blob/master/stable/kubernetes-pfsense-controller/values.yaml
+helm upgrade \
+--install \
+--create-namespace \
+--namespace kpc \
+--values values.yaml \
+kpc-primary \
+kubernetes-pfsense-controller/kubernetes-pfsense-controller
+```
+
+## Support Matrix
+
+Generally speaking `kpc` tracks the most recent versions of both kubernetes and pfSense. Having said that reasonable
+attempts will be made to support older versions of both.
+
+`kpc` currently works with any `2.4+` (known working up to `2.5.2`) version of pfSense and probably very old kubernetes
+versions (known working up to `1.22`).
+
 # Plugins
 The controller is comprised of several plugins that are enabled/disabled/configured via a Kubernetes ConfigMap.  Details
 about each plugin follows below.
@@ -24,15 +60,25 @@ combination of Layer2 or BGP type configurations.  Layer2 requires no integratio
 leverage the BGP implementation you need a BGP server along with neighbor configuration.  `kpc` *dynamically* updates
 bgp neighbors for you in pfSense by continually monitoring cluster `Node`s.
 
-The plugin assumes you've already installed openbgp and configured it as well as created a `group` to use with MetalLB.
+While this plugin is *named* `metallb` it does not **require** MetalLB to be installed or in use. It can be used with
+`kube-vip` or any other service that requires BGP peers/neighbors.
+
+The plugin assumes you've already installed openbgp or frr and configured it as well as created a `group` to use with
+MetalLB.
 
 ```yaml
       metallb:
         enabled: true
         nodeLabelSelector:
         nodeFieldSelector:
-        bgp-implementation: openbgp
+        # pick 1 implementation
+        # bgp-implementation: openbgp
+        bgp-implementation: frr
         options:
+          frr:
+            template:
+              peergroup: metallb
+
           openbgp:
             template:
               md5sigkey:
@@ -47,7 +93,7 @@ The plugin assumes you've already installed openbgp and configured it as well as
 `haproxy-declarative` plugin allows you to declaratively create HAProxy frontend/backend definitions as `ConfigMap`
 resources in the cluster.  When declaring backends however, the pool of servers can/will be dynamically created/updated
 based on cluster nodes.  See [declarative-example.yaml](examples/declarative-example.yaml) for an example.
- 
+
 ```yaml
       haproxy-declarative:
         enabled: true
@@ -62,6 +108,12 @@ To achieve this goal, new 'shared' HAProxy frontends are created and attached to
 created frontend should also set an existing backend.  Note that existing frontend(s)/backend(s) can be created manually
 or using the `haproxy-declarative` plugin.
 
+When creating the parent frontend(s) please note that the selected type should be `http / https(offloading)` to fully
+support the feature. If type `ssl / https(TCP mode)` is selected (`SSL Offloading` may be selected or not in the
+`External address` table) `sni` is used for routing logic and **CANNOT** support path-based logic which implies a 1:1
+mapping between `host` entries and backing `service`s. Type `tcp` will not work and any `Ingress` resources that would
+be bound to a frontend of this type are ignored.
+
 Combined with `haproxy-declarative` you can create a dynamic backend service (ie: your ingress controller) and
 subsequently dynamic frontend services based off of cluster ingresses.  This is generally helpful when you cannot or do
 not for whatever reason create wildcard frontend(s) to handle incoming traffic in HAProxy on pfSense.
@@ -69,11 +121,20 @@ not for whatever reason create wildcard frontend(s) to handle incoming traffic i
 Optionally, on the ingress resources you can set the following annotations: `haproxy-ingress-proxy.pfsense.org/frontend`
 and `haproxy-ingress-proxy.pfsense.org/backend` to respectively set the frontend and backend to override the defaults.
 
+In advanced scenarios it is possible to provide a template definition of the shared frontend using the
+`haproxy-ingress-proxy.pfsense.org/frontendDefinitionTemplate` annotation (see
+https://github.com/travisghansen/kubernetes-pfsense-controller/issues/19#issuecomment-1416576678).
+
 ```yaml
       haproxy-ingress-proxy:
         enabled: true
         ingressLabelSelector:
         ingressFieldSelector:
+        # works in conjunction with the ingress annotation 'haproxy-ingress-proxy.pfsense.org/enabled'
+        # if defaultEnabled is empty or true, you can disable specific ingresses by setting the annotation to false
+        # if defaultEnabled is false, you can enable specific ingresses by setting the annotation to true
+        defaultEnabled: true
+        # can optionally be comma-separated list if you want the same ingress to be served by multiple frontends
         defaultFrontend: http-80
         defaultBackend: traefik
         #allowedHostRegex: "/.*/"
@@ -86,9 +147,9 @@ powerful setups/combinations.
 
 ### pfsense-dns-services
 `pfsense-dns-services` watches for services of type `LoadBalancer` that have the annotation `dns.pfsense.org/hostname`
-with the value of the desired hostname.  `kpc` will create the DNS entry in unbound/dnsmasq.  Note that to actually get
-an IP on these services you'll likely need `MetalLB` deployed in the cluster (regardless of the `metallb` plugin running
-or not).
+with the value of the desired hostname (optionally you may specifiy a comma-separated list of hostnames).  `kpc` will
+create the DNS entry in unbound/dnsmasq.  Note that to actually get  an IP on these services you'll likely need
+`MetalLB` deployed in the cluster (regardless of the `metallb` plugin running or not).
 
 ```yaml
       pfsense-dns-services:
@@ -112,6 +173,10 @@ support from the ingress controller to set IPs on the ingress resources.
         enabled: true
         ingressLabelSelector:
         ingressFieldSelector:
+        # works in conjunction with the ingress annotation 'dns.pfsense.org/enabled'
+        # if defaultEnabled is empty or true, you can disable specific ingresses by setting the annotation to false
+        # if defaultEnabled is false, you can enable specific ingresses by setting the annotation to true
+        defaultEnabled: true
         #allowedHostRegex: "/.*/"
         dnsBackends:
           dnsmasq:
@@ -131,6 +196,7 @@ sure the static `hostname` created in your DNS service of choice points to the/a
 ```yaml
       pfsense-dns-haproxy-ingress-proxy:
         enabled: true
+        # NOTE: this regex is in *addition* to the regex applied to the haproxy-ingress-proxy plugin
         #allowedHostRegex: "/.*/"
         dnsBackends:
           dnsmasq:
@@ -171,6 +237,14 @@ can be established.  Each `kpc` instance will only require 1 process (ie: access
  1. validate configuration(s) to ensure proper schema
 
 # Development
+
+## check store values
+
+```
+kubectl -n kube-system get configmaps kubernetes-pfsense-controller-store -o json | jq -crM '.data."haproxy-declarative"' | jq .
+kubectl -n kube-system get configmaps kubernetes-pfsense-controller-store -o json | jq -crM '.data."metallb"' | jq .
+...
+```
 
 ## HAProxy
 XML config structure (note that `ha_backends` is actually frontends...it's badly named):

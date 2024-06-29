@@ -10,12 +10,11 @@ namespace KubernetesPfSenseController\Plugin;
  */
 class MetalLB extends PfSenseAbstract
 {
+    use CommonTrait;
     /**
      * Unique plugin ID
      */
-    const PLUGIN_ID = 'metallb';
-
-    use CommonTrait;
+    public const PLUGIN_ID = 'metallb';
 
     /**
      * Init the plugin
@@ -26,19 +25,15 @@ class MetalLB extends PfSenseAbstract
     {
         $controller = $this->getController();
         $pluginConfig = $this->getConfig();
-        $nodeLabelSelector = $pluginConfig['nodeLabelSelector'];
-        $nodeFieldSelector = $pluginConfig['nodeFieldSelector'];
-
-        // metallb config
-        $watch = $controller->getKubernetesClient()->createWatch('/api/v1/watch/namespaces/metallb-system/configmaps/config', [], $this->getMetalLbConfigWatchCallback());
-        $this->addWatch($watch);
+        $nodeLabelSelector = $pluginConfig['nodeLabelSelector'] ?? null;
+        $nodeFieldSelector = $pluginConfig['nodeFieldSelector'] ?? null;
 
         // initial load of nodes
         $params = [
             'labelSelector' => $nodeLabelSelector,
             'fieldSelector' => $nodeFieldSelector,
         ];
-        $nodes = $controller->getKubernetesClient()->request('/api/v1/nodes', 'GET', $params);
+        $nodes = $controller->getKubernetesClient()->createList('/api/v1/nodes', $params)->get();
         $this->state['nodes'] = $nodes['items'];
 
         // watch for node changes
@@ -50,28 +45,6 @@ class MetalLB extends PfSenseAbstract
         $watch = $controller->getKubernetesClient()->createWatch('/api/v1/watch/nodes', $params, $this->getNodeWatchCallback('nodes'));
         $this->addWatch($watch);
         $this->delayedAction();
-    }
-
-    /**
-     * Callback for the metallb configmqp
-     *
-     * @return \Closure
-     */
-    private function getMetalLbConfigWatchCallback()
-    {
-        return function ($event, $watch) {
-            $this->logEvent($event);
-            switch ($event['type']) {
-                case 'ADDED':
-                case 'MODIFIED':
-                    $this->state['metallb-config'] = yaml_parse($event['object']['data']['config']);
-                    $this->delayedAction();
-                    break;
-                case 'DELETED':
-                    $this->state['metallb-config'] = null;
-                    break;
-            }
-        };
     }
 
     /**
@@ -102,16 +75,12 @@ class MetalLB extends PfSenseAbstract
      */
     public function doAction()
     {
-        $metalConfig = $this->state['metallb-config'];
         $pluginConfig = $this->getConfig();
-
-        if (empty($metalConfig)) {
-            return false;
-        }
 
         switch ($pluginConfig['bgp-implementation']) {
             case 'openbgp':
-                return $this->doActionOpenbgp();
+            case 'frr':
+                return $this->doActionGeneric();
                 break;
             default:
                 $this->log('unsupported bgp-implementation: '.$pluginConfig['bgp-implementation']);
@@ -121,116 +90,135 @@ class MetalLB extends PfSenseAbstract
     }
 
     /**
-     * Update pfSense state for openbgp
+     * Update pfSense state for bgp implementation
      *
      * @return bool
      */
-    private function doActionOpenbgp()
+    private function doActionGeneric()
     {
-        $metalConfig = $this->state['metallb-config'];
-        $openbgpConfig = PfSenseConfigBlock::getInstalledPackagesConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'openbgpdneighbors');
-        if (empty($openbgpConfig->data)) {
-            $openbgpConfig->data = [];
-        }
-
-        if (empty($openbgpConfig->data['config'])) {
-            $openbgpConfig->data['config'] = [];
-        }
-
         $pluginConfig = $this->getConfig();
 
-        $bgpEnabled = false;
-        foreach ($metalConfig['address-pools'] as $pool) {
-            if ($pool['protocol'] == 'bgp') {
-                $bgpEnabled = true;
+        switch ($pluginConfig['bgp-implementation']) {
+            case 'openbgp':
+                $bgpConfig = PfSenseConfigBlock::getInstalledPackagesConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'openbgpdneighbors');
                 break;
-            }
+            case 'frr':
+                $bgpConfig = PfSenseConfigBlock::getInstalledPackagesConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'frrbgpneighbors');
+                break;
+            default:
+                $this->log('unsupported bgp-implementation: '.$pluginConfig['bgp-implementation']);
+                return false;
+                break;
         }
 
-        if ($bgpEnabled) {
-            // add/remove as necessary
-            $template = $pluginConfig['options']['openbgp']['template'];
+        if (empty($bgpConfig->data)) {
+            $bgpConfig->data = [];
+        }
 
-            $nodes = $this->state['nodes'];
-            $neighbors = [];
-            $managedNeighborsPreSave = [];
-            foreach ($nodes as $node) {
-                $host = 'kpc-'.KubernetesUtils::getNodeIp($node);
-                $managedNeighborsPreSave[$host] = [
-                    'resource' => $this->getKubernetesResourceDetails($node),
-                ];
-                $neighbor = [
-                    'descr' => $host,
-                    'neighbor' => KubernetesUtils::getNodeIp($node),
+        if (empty($bgpConfig->data['config'])) {
+            $bgpConfig->data['config'] = [];
+        }
+
+        // add/remove as necessary
+        $template = $pluginConfig['options'][$pluginConfig['bgp-implementation']]['template'];
+        switch ($pluginConfig['bgp-implementation']) {
+            case 'openbgp':
+                $defaults = [
                     'md5sigkey' => (string) $template['md5sigkey'],
                     'md5sigpass' => (string) $template['md5sigpass'],
                     'groupname' => (string) $template['groupname'],
-                    'row' => $template['row'],
                 ];
-                $neighbors[] = $neighbor;
+                $template = array_merge($defaults, $template);
+                $template = array_map(function ($v) {
+                    return $v ?: '';
+                }, $template);
+                break;
+            case 'frr':
+                $defaults = [
+                    "sendcommunity" => "disabled",
+                ];
+                $template = array_merge($defaults, $template);
+                $template = array_map(function ($v) {
+                    return $v ?: '';
+                }, $template);
+                break;
+        }
+
+        $nodes = $this->state['nodes'];
+        $neighbors = [];
+        $managedNeighborsPreSave = [];
+        foreach ($nodes as $node) {
+            $host = 'kpc-'.KubernetesUtils::getNodeIp($node);
+            $managedNeighborsPreSave[$host] = [
+                'resource' => $this->getKubernetesResourceDetails($node),
+            ];
+            $neighbor = $template;
+
+            switch ($pluginConfig['bgp-implementation']) {
+                case 'openbgp':
+                    $neighbor['descr'] = $host;
+                    $neighbor['neighbor'] = KubernetesUtils::getNodeIp($node);
+                    break;
+                case 'frr':
+                    $neighbor['descr'] = $host;
+                    $neighbor['peer'] = KubernetesUtils::getNodeIp($node);
+                    break;
             }
 
-            // get store data
-            $store = $this->getStore();
-            $managedNeighborNamesPreSave = @array_keys($managedNeighborsPreSave);
-            $managedNeighborNames = @array_keys($store['openbgp']['managed_neighbors']);
-            if (empty($managedNeighborNames)) {
-                $managedNeighborNames = [];
-            }
+            $neighbors[] = $neighbor;
+        }
 
-            // update config with new/updated items
-            foreach ($neighbors as $neighbor) {
-                Utils::putListItem($openbgpConfig->data['config'], $neighbor, 'descr');
-            }
+        // get store data
+        $store = $this->getStore();
+        if (empty($store)) {
+            $store = [];
+        }
 
-            // remove items from config
-            $toDeleteItemNames = array_diff($managedNeighborNames, $managedNeighborNamesPreSave);
-            foreach ($toDeleteItemNames as $itemId) {
-                Utils::removeListItem($openbgpConfig->data['config'], $itemId, 'descr');
-            }
+        $store[$pluginConfig['bgp-implementation']] = $store[$pluginConfig['bgp-implementation']] ?? [];
+        $store[$pluginConfig['bgp-implementation']]['managed_neighbors'] = $store[$pluginConfig['bgp-implementation']]['managed_neighbors'] ?? [];
 
-            // prep config for save
-            if (empty($openbgpConfig->data['config'])) {
-                $openbgpConfig->data = null;
-            }
+        $managedNeighborNamesPreSave = @array_keys($managedNeighborsPreSave);
+        $managedNeighborNames = @array_keys($store[$pluginConfig['bgp-implementation']]['managed_neighbors']);
+        if (empty($managedNeighborNames)) {
+            $managedNeighborNames = [];
+        }
 
-            // save newly managed configuration
-            try {
-                $this->savePfSenseConfigBlock($openbgpConfig);
-                $this->reloadOpenbgp();
-                $store['openbgp']['managed_neighbors'] = $managedNeighborsPreSave;
-                $this->saveStore($store);
+        // update config with new/updated items
+        foreach ($neighbors as $neighbor) {
+            $this->log('ensuring peer: '.$neighbor['descr']);
+            Utils::putListItem($bgpConfig->data['config'], $neighbor, 'descr');
+        }
 
-                return true;
-            } catch (\Exception $e) {
-                $this->log('failed update/reload: '.$e->getMessage().' ('.$e->getCode().')');
-                return false;
-            }
-        } else {
-            //remove any nodes from config
-            // get storage data
-            $store = $this->getStore();
-            $managedNeighborNames = @array_keys($store['openbgp']['managed_neighbors']);
-            if (empty($managedNeighborNames)) {
-                return true;
-            }
+        // remove items from config
+        $toDeleteItemNames = array_diff($managedNeighborNames, $managedNeighborNamesPreSave);
+        foreach ($toDeleteItemNames as $itemId) {
+            $this->log('removing peer: '.$itemId);
+            Utils::removeListItem($bgpConfig->data['config'], $itemId, 'descr');
+        }
 
-            foreach ($managedNeighborNames as $itemId) {
-                Utils::removeListItem($openbgpConfig->data['config'], $itemId, 'descr');
-            }
+        // prep config for save
+        if (empty($bgpConfig->data['config'])) {
+            $bgpConfig->data = null;
+        }
 
-            // save newly managed configuration
-            try {
-                $this->savePfSenseConfigBlock($openbgpConfig);
-                $this->reloadOpenbgp();
-                $store['openbgp']['managed_neighbors'] = [];
-                $this->saveStore($store);
-
-                return true;
-            } catch (\Exception $e) {
-                $this->log('failed update/reload: '.$e->getMessage().' ('.$e->getCode().')');
-                return false;
+        // save newly managed configuration
+        try {
+            $this->savePfSenseConfigBlock($bgpConfig);
+            switch ($pluginConfig['bgp-implementation']) {
+                case 'openbgp':
+                    $this->reloadOpenbgp();
+                    break;
+                case 'frr':
+                    $this->reloadFrrBgp();
+                    break;
             }
+            $store[$pluginConfig['bgp-implementation']]['managed_neighbors'] = $managedNeighborsPreSave;
+            $this->saveStore($store);
+
+            return true;
+        } catch (\Exception $e) {
+            $this->log('failed update/reload: '.$e->getMessage().' ('.$e->getCode().')');
+            return false;
         }
     }
 }

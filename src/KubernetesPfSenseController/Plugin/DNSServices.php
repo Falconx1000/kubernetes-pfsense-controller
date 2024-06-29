@@ -12,13 +12,12 @@ namespace KubernetesPfSenseController\Plugin;
  */
 class DNSServices extends PfSenseAbstract
 {
+    use CommonTrait;
+    use DNSResourceTrait;
     /**
      * Unique plugin ID
      */
-    const PLUGIN_ID = 'pfsense-dns-services';
-
-    use CommonTrait;
-    use DNSResourceTrait;
+    public const PLUGIN_ID = 'pfsense-dns-services';
 
     /**
      * Init the plugin
@@ -29,15 +28,15 @@ class DNSServices extends PfSenseAbstract
     {
         $controller = $this->getController();
         $pluginConfig = $this->getConfig();
-        $serviceLabelSelector = $pluginConfig['serviceLabelSelector'];
-        $serviceFieldSelector = $pluginConfig['serviceFieldSelector'];
+        $serviceLabelSelector = $pluginConfig['serviceLabelSelector'] ?? null;
+        $serviceFieldSelector = $pluginConfig['serviceFieldSelector'] ?? null;
 
         // initial load of services
         $params = [
             'labelSelector' => $serviceLabelSelector,
             'fieldSelector' => $serviceFieldSelector,
         ];
-        $services = $controller->getKubernetesClient()->request('/api/v1/services', 'GET', $params);
+        $services = $controller->getKubernetesClient()->createList('/api/v1/services', $params)->get();
         $this->state['resources'] = $services['items'];
 
         // watch for service changes
@@ -93,12 +92,14 @@ class DNSServices extends PfSenseAbstract
         if (!$this->shouldCreateHost($service)) {
             return;
         }
-        $hostName = KubernetesUtils::getServiceHostname($service);
+        $hostNames = KubernetesUtils::getServiceHostname($service);
         $ip = KubernetesUtils::getServiceIp($service);
-        $resourceHosts[$hostName] = [
-            'ip' => $ip,
-            'resource' => $service,
-        ];
+        foreach ($hostNames as $hostName) {
+            $resourceHosts[$hostName] = [
+                'ip' => $ip,
+                'resource' => $service,
+            ];
+        }
     }
 
     /**
@@ -126,11 +127,13 @@ class DNSServices extends PfSenseAbstract
         }
 
         $pluginConfig = $this->getConfig();
-        $hostName = KubernetesUtils::getServiceHostname($service);
+        $hostNames = KubernetesUtils::getServiceHostname($service);
         if (!empty($pluginConfig['allowedHostRegex'])) {
-            $allowed = @preg_match($pluginConfig['allowedHostRegex'], $hostName);
-            if ($allowed !== 1) {
-                return false;
+            foreach ($hostNames as $hostName) {
+                $allowed = @preg_match($pluginConfig['allowedHostRegex'], $hostName);
+                if ($allowed !== 1) {
+                    return false;
+                }
             }
         }
 

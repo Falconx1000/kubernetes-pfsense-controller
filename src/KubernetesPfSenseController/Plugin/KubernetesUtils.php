@@ -13,7 +13,7 @@ class KubernetesUtils
     /**
      * Annotation used to set hostname on services (ie: LoadBalancer services)
      */
-    const SERVICE_HOSTNAME_ANNOTATION = 'dns.pfsense.org/hostname';
+    public const SERVICE_HOSTNAME_ANNOTATION = 'dns.pfsense.org/hostname';
 
     public static function getResourceAnnotationValue($resource, $annotation)
     {
@@ -75,7 +75,7 @@ class KubernetesUtils
      */
     public static function getResourceApiVersion($resource)
     {
-        return $resource['apiVersion'];
+        return $resource['apiVersion'] ?? "";
     }
 
     /**
@@ -86,18 +86,7 @@ class KubernetesUtils
      */
     public static function getResourceKind($resource)
     {
-        return $resource['kind'];
-    }
-
-    /**
-     * Get selfLink property from resource
-     *
-     * @param $resource
-     * @return mixed
-     */
-    public static function getResourceSelfLink($resource)
-    {
-        return $resource['metadata']['selfLink'];
+        return $resource['kind'] ?? "";
     }
 
     /**
@@ -108,7 +97,7 @@ class KubernetesUtils
      */
     public static function getResourceNamespace($resource)
     {
-        return $resource['metadata']['namespace'];
+        return (isset($resource['metadata']) && isset($resource['metadata']['namespace'])) ? $resource['metadata']['namespace'] : "";
     }
 
     /**
@@ -119,7 +108,7 @@ class KubernetesUtils
      */
     public static function getResourceName($resource)
     {
-        return $resource['metadata']['name'];
+        return (isset($resource['metadata']) && isset($resource['metadata']['name'])) ? $resource['metadata']['name'] : "";
     }
 
     public static function getResourceNamespaceHyphenName($resource)
@@ -152,7 +141,7 @@ class KubernetesUtils
      * @param $namespace
      * @return array
      */
-    public static function findListItem($list, $name, $namespace = null)
+    public static function findListItem(&$list, $name, $namespace = null)
     {
         $itemKey = null;
         $item = null;
@@ -186,7 +175,7 @@ class KubernetesUtils
      */
     public static function putListItem(&$list, $item)
     {
-        $result = self::findListItem($list, $item['metadata']['name'], $item['metadata']['namespace']);
+        $result = self::findListItem($list, self::getResourceName($item), self::getResourceNamespace($item));
         $itemKey = $result['key'];
 
         if ($itemKey === null) {
@@ -204,7 +193,7 @@ class KubernetesUtils
      */
     public static function getServiceIp($service)
     {
-        return $service['status']['loadBalancer']['ingress'][0]['ip'];
+        return $service['status']['loadBalancer']['ingress'][0]['ip'] ?? null;
     }
 
     /**
@@ -228,7 +217,11 @@ class KubernetesUtils
     {
         foreach ($service['metadata']['annotations'] as $key => $value) {
             if ($key == self::SERVICE_HOSTNAME_ANNOTATION) {
-                return $value;
+                $hosts = explode(",", $value);
+                array_walk($hosts, function (&$host) {
+                    $host = trim($host);
+                });
+                return $hosts;
             }
         }
     }

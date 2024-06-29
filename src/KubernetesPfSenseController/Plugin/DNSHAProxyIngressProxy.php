@@ -10,10 +10,11 @@ namespace KubernetesPfSenseController\Plugin;
  */
 class DNSHAProxyIngressProxy extends PfSenseAbstract
 {
+    use CommonTrait;
     /**
      * Unique plugin ID
      */
-    const PLUGIN_ID = 'pfsense-dns-haproxy-ingress-proxy';
+    public const PLUGIN_ID = 'pfsense-dns-haproxy-ingress-proxy';
 
     /**
      * Hash of haproxy-ingress-proxy state used to detect changes
@@ -21,8 +22,6 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
      * @var string
      */
     private $hash;
-
-    use CommonTrait;
 
     /**
      * Init the plugin
@@ -36,7 +35,10 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
         // 1.20 will kill the old version
         // https://kubernetes.io/blog/2019/07/18/api-deprecations-in-1-16/
         $kubernetesMajorMinor = $controller->getKubernetesVersionMajorMinor();
-        if (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.14')) {
+        if (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.19')) {
+            $ingressResourcePath = '/apis/networking.k8s.io/v1/ingresses';
+            $ingressResourceWatchPath = '/apis/networking.k8s.io/v1/watch/ingresses';
+        } elseif (\Composer\Semver\Comparator::greaterThanOrEqualTo($kubernetesMajorMinor, '1.14')) {
             $ingressResourcePath = '/apis/networking.k8s.io/v1beta1/ingresses';
             $ingressResourceWatchPath = '/apis/networking.k8s.io/v1beta1/watch/ingresses';
         } else {
@@ -44,9 +46,13 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
             $ingressResourceWatchPath = '/apis/extensions/v1beta1/watch/ingresses';
         }
 
+        $storeNamespace = $controller->getStoreNamespace();
+        $storeName = $controller->getStoreName();
+        $configMapResourceWatchPath = "/api/v1/watch/namespaces/{$storeNamespace}/configmaps/{$storeName}";
+
         // initial load of ingresses
         $params = [];
-        $ingresses = $controller->getKubernetesClient()->request($ingressResourcePath, 'GET', $params);
+        $ingresses = $controller->getKubernetesClient()->createList($ingressResourcePath, $params)->get();
         $this->state['ingresses'] = $ingresses['items'];
 
         // watch for ingress changes
@@ -58,6 +64,14 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
             'log' => true
         ];
         $watch = $controller->getKubernetesClient()->createWatch($ingressResourceWatchPath, $params, $this->getWatchCallback('ingresses', $options));
+        $this->addWatch($watch);
+
+        $this->state['controller_store'] = [];
+        $options = [
+            'trigger' => false,
+            'log' => true
+        ];
+        $watch = $controller->getKubernetesClient()->createWatch($configMapResourceWatchPath, [], $this->getWatchCallback('controller_store', $options));
         $this->addWatch($watch);
 
         $this->generateHash();
@@ -104,8 +118,8 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
 
         $pluginConfig = $this->getConfig();
 
-        $dnsmasqEnabled = $pluginConfig['dnsBackends']['dnsmasq']['enabled'];
-        $unboundEnabled = $pluginConfig['dnsBackends']['unbound']['enabled'];
+        $dnsmasqEnabled = $pluginConfig['dnsBackends']['dnsmasq']['enabled'] ?? false;
+        $unboundEnabled = $pluginConfig['dnsBackends']['unbound']['enabled'] ?? false;
 
         // only supported options move along
         if (!$dnsmasqEnabled && !$unboundEnabled) {
@@ -116,23 +130,41 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
         $haProxyConfig = HAProxyConfig::getInstalledPackagesConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'haproxy');
 
         $store = $this->getStore();
-        $ingressProxyPluginStore = $ingressProxyPlugin->getStore();
-
-        $managedHostsPreSave = [];
-        $managedHosts = $store['managed_hosts'];
-        if (empty($managedHosts)) {
-            $managedHosts = [];
+        if (empty($store)) {
+            $store = [];
         }
-        $hosts = [];
-        foreach ($ingressProxyPluginStore['managed_frontends'] as $frontendName => $frontendDetails) {
-            $primaryFrontendName = $haProxyConfig->getFrontend($frontendName)['primary_frontend'];
-            $hostName = $pluginConfig['frontends'][$primaryFrontendName]['hostname'];
+
+        if (!key_exists('managed_hosts', $store)) {
+            $store['managed_hosts'] = [];
+        }
+        $ingressProxyPluginStore = $ingressProxyPlugin->getStore();
+        if (empty(($ingressProxyPluginStore))) {
+            $ingressProxyPluginStore = [];
+        }
+
+        $managedFrontends = $ingressProxyPluginStore['managed_frontends'] ?? [];
+        $managedHostsPreSave = [];
+        $managedHosts = $store['managed_hosts'] ?? [];
+
+        foreach ($managedFrontends as $frontendName => $frontendDetails) {
+            $primaryFrontendName = $haProxyConfig->getFrontend($frontendName)['primary_frontend'] ?? null;
+            if (empty($primaryFrontendName)) {
+                continue;
+            }
+            $hostName = $pluginConfig['frontends'][$primaryFrontendName]['hostname'] ?? null;
+            if (empty($hostName)) {
+                continue;
+            }
+
             $ingress = KubernetesUtils::getResourceByNamespaceName($this->state['ingresses'], $frontendDetails['resource']['namespace'], $frontendDetails['resource']['name']);
             if (!empty($ingress)) {
                 foreach ($ingress['spec']['rules'] as $rule) {
-                    $hosts[$frontendName] = [];
                     if ($this->shouldCreateAlias($rule['host'])) {
-                        $hosts[$frontendName][] = $rule['host'];
+                        if (empty($hostName)) {
+                            $this->log(('missing hostname in config for primary frontend: '.$primaryFrontendName.', ingress host: '.$rule['host']));
+                            continue;
+                        }
+
                         $managedHostsPreSave[$hostName][] = $rule['host'];
                     }
                 }
@@ -141,35 +173,35 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
 
         if ($dnsmasqEnabled) {
             $dnsmasqConfig = PfSenseConfigBlock::getRootConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'dnsmasq');
+            if (!key_exists('hosts', $dnsmasqConfig->data)) {
+                $dnsmasqConfig->data['hosts'] = [];
+            }
         }
 
         if ($unboundEnabled) {
             $unboundConfig = PfSenseConfigBlock::getRootConfigBlock($this->getController()->getRegistryItem('pfSenseClient'), 'unbound');
+            if (!key_exists('hosts', $unboundConfig->data)) {
+                $unboundConfig->data['hosts'] = [];
+            }
         }
 
-        foreach ($hosts as $frontendName => $value) {
-            $host = null;
-            $primaryFrontendName = $haProxyConfig->getFrontend($frontendName)['primary_frontend'];
-            $hostName = $pluginConfig['frontends'][$primaryFrontendName]['hostname'];
-            $itemId = $itemId = [
+        foreach ($managedHostsPreSave as $hostName => $aliases) {
+            $itemId = [
                 'host' => explode('.', $hostName, 2)[0],
                 'domain' => explode('.', $hostName, 2)[1],
             ];
             $itemKey = ['host', 'domain'];
-            if (empty($hostName)) {
-                $this->log(('missing hostname for primary frontend: '.$primaryFrontendName));
-                continue;
-            }
 
             if ($dnsmasqEnabled) {
+                $this->log('setting dnsmasq host aliases for host: '.$hostName.', alias count: '. count($aliases));
                 $host = null;
                 $host = Utils::getListItemMultiKey($dnsmasqConfig->data['hosts'], $itemId, $itemKey);
                 if ($host !== null) {
-                    if (empty($hosts[$frontendName])) {
+                    if (empty($aliases)) {
                         $host['aliases'] = '';
                     } else {
-                        foreach ($hosts[$frontendName] as $alias) {
-                            $host['aliases'] = [];
+                        $host['aliases'] = [];
+                        foreach ($aliases as $alias) {
                             $host['aliases']['item'][] = [
                                 'host' => explode('.', $alias, 2)[0],
                                 'domain' => explode('.', $alias, 2)[1],
@@ -185,14 +217,15 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
             }
 
             if ($unboundEnabled) {
+                $this->log('setting unbound host aliases for host: '.$hostName.', alias count: '. count($aliases));
                 $host = null;
-                $host = Utils::getListItemMultiKey($unboundConfig->data['hosts'], $itemId, ['host', 'domain']);
+                $host = Utils::getListItemMultiKey($unboundConfig->data['hosts'], $itemId, $itemKey);
                 if ($host !== null) {
-                    if (empty($hosts[$frontendName])) {
+                    if (empty($aliases)) {
                         $host['aliases'] = '';
                     } else {
-                        foreach ($hosts[$frontendName] as $alias) {
-                            $host['aliases'] = [];
+                        $host['aliases'] = [];
+                        foreach ($aliases as $alias) {
                             $host['aliases']['item'][] = [
                                 'host' => explode('.', $alias, 2)[0],
                                 'domain' => explode('.', $alias, 2)[1],
@@ -210,13 +243,14 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
 
         $toDeleteHosts = array_diff(@array_keys($managedHosts), @array_keys($managedHostsPreSave));
         foreach ($toDeleteHosts as $hostName) {
-            $itemId = $itemId = [
+            $itemId = [
                 'host' => explode('.', $hostName, 2)[0],
                 'domain' => explode('.', $hostName, 2)[1],
             ];
             $itemKey = ['host', 'domain'];
 
             if ($dnsmasqEnabled) {
+                $this->log('removing dnsmasq host aliases for host: '.$hostName);
                 $host = null;
                 $host = Utils::getListItemMultiKey($dnsmasqConfig->data['hosts'], $itemId, $itemKey);
                 if ($host !== null) {
@@ -226,8 +260,9 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
             }
 
             if ($unboundEnabled) {
+                $this->log('removing unbound host aliases for host: '.$hostName);
                 $host = null;
-                $host = Utils::getListItemMultiKey($unboundConfig->data['hosts'], $itemId, ['host', 'domain']);
+                $host = Utils::getListItemMultiKey($unboundConfig->data['hosts'], $itemId, $itemKey);
                 if ($host !== null) {
                     $host['aliases'] = '';
                     Utils::putListItemMultiKey($unboundConfig->data['hosts'], $host, $itemKey);
@@ -267,6 +302,15 @@ class DNSHAProxyIngressProxy extends PfSenseAbstract
      */
     private function shouldCreateAlias($hostName)
     {
+        $ingressProxyPlugin = $this->getController()->getPluginById(HAProxyIngressProxy::getPluginId());
+        $pluginConfig = $ingressProxyPlugin->getConfig();
+        if (!empty($pluginConfig['allowedHostRegex'])) {
+            $allowed = @preg_match($pluginConfig['allowedHostRegex'], $hostName);
+            if ($allowed !== 1) {
+                return false;
+            }
+        }
+
         $pluginConfig = $this->getConfig();
         if (!empty($pluginConfig['allowedHostRegex'])) {
             $allowed = @preg_match($pluginConfig['allowedHostRegex'], $hostName);

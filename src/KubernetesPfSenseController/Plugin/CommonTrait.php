@@ -21,11 +21,11 @@ trait CommonTrait
     private function getNodeWatchCallback($stateKey, $options = [])
     {
         return function ($event, $watch) use ($stateKey, $options) {
-            if ($options['log']) {
+            if (isset($options['log']) && $options['log']) {
                 $this->logEvent($event);
             }
 
-            if ($options['trigger'] !== false) {
+            if (!isset($options['trigger']) || $options['trigger'] !== false) {
                 $trigger = true;
             } else {
                 $trigger = false;
@@ -57,7 +57,7 @@ trait CommonTrait
                         $oldNodeIp = KubernetesUtils::getNodeIp($oldNode);
 
                         if ($oldNodeIp != $nodeIp) {
-                            $this->log("NodeIP Address Changed - NewIp: ${nodeIp}, OldIP: ${oldNodeIp}");
+                            $this->log("NodeIP Address Changed - NewIp: {$nodeIp}, OldIP: {$oldNodeIp}");
                             if ($trigger) {
                                 $this->delayedAction();
                             }
@@ -89,11 +89,11 @@ trait CommonTrait
     private function getWatchCallback($stateKey, $options = [])
     {
         return function ($event, $watch) use ($stateKey, $options) {
-            if ($options['log']) {
+            if (isset($options['log']) && $options['log']) {
                 $this->logEvent($event);
             }
 
-            if ($options['trigger'] !== false) {
+            if (!isset($options['trigger']) || $options['trigger'] !== false) {
                 $trigger = true;
             } else {
                 $trigger = false;
@@ -101,6 +101,7 @@ trait CommonTrait
 
             $key = $stateKey;
             $items = &$this->state[$key];
+            $oldItem = null;
 
             $item = $event['object'];
             unset($item['kind']);
@@ -112,17 +113,8 @@ trait CommonTrait
                     $result = KubernetesUtils::findListItem($items, $item['metadata']['name']);
                     $itemKey = $result['key'];
                     $oldItem = $result['item'];
-
                     KubernetesUtils::putListItem($items, $item);
-                    if ($trigger) {
-                        $shouldTriggerFromWatchUpdate = true;
-                        if ($itemKey !== null && method_exists($this, 'shouldTriggerFromWatchUpdate')) {
-                            $shouldTriggerFromWatchUpdate = $this->shouldTriggerFromWatchUpdate($oldItem, $item);
-                        }
-                        if ($shouldTriggerFromWatchUpdate) {
-                            $this->delayedAction();
-                        }
-                    }
+
                     break;
                 case 'DELETED':
                     $result = KubernetesUtils::findListItem($items, $item['metadata']['name'], $item['metadata']['namespace']);
@@ -130,11 +122,22 @@ trait CommonTrait
                     if ($itemKey !== null) {
                         unset($items[$itemKey]);
                         $items = array_values($items);
-                        if ($trigger) {
-                            $this->delayedAction();
-                        }
                     }
                     break;
+            }
+
+            if ($trigger) {
+                $shouldTriggerFromWatchUpdate = true;
+                /**
+                 * NOTE: usage of $stateKey and $options here allows 'outside' user to set arbitrary data that
+                 * can be used for correlation purposes etc
+                 */
+                if (method_exists($this, 'shouldTriggerFromWatchUpdate')) {
+                    $shouldTriggerFromWatchUpdate = $this->shouldTriggerFromWatchUpdate($event, $oldItem, $item, $stateKey, $options);
+                }
+                if ($shouldTriggerFromWatchUpdate) {
+                    $this->delayedAction();
+                }
             }
         };
     }
@@ -151,12 +154,10 @@ trait CommonTrait
         $kind = KubernetesUtils::getResourceKind($resource);
         $name = KubernetesUtils::getResourceName($resource);
         $namespace = KubernetesUtils::getResourceNamespace($resource);
-        $selfLink = KubernetesUtils::getResourceSelfLink($resource);
 
         $values = [
             //'apiVersion' => $apiVersion,
             //'kind' => $kind,
-            'selfLink' => $selfLink,
             'name' => $name,
         ];
 
