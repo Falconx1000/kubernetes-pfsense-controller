@@ -122,11 +122,15 @@ class KubernetesUtils
      * @param $node
      * @return mixed
      */
-    public static function getNodeIp($node)
+    public static function getNodeIp($node, $ipoType = 'internal')
     {
         if (is_array($node['status']['addresses'])) {
             foreach ($node['status']['addresses'] as $address) {
-                if ($address['type'] == 'InternalIP') {
+                // Check if the address type matches the desired IP type AND 
+                // if the requested type is 'any' or matches this specific type.
+                if (($ipType === 'internal' && $address['type'] == 'InternalIP') ||
+                    ($ipType === 'external' && $address['type'] == 'ExternalIP') ||
+                    ($ipType === 'any')) {
                     return $address['address'];
                 }
             }
