@@ -74,6 +74,9 @@ if (getenv('CONTROLLER_NAMESPACE')) {
     $controllerNamespace = 'kube-system';
 }
 
+if (getenv('IPADDRESS_TYPE')) {
+    $ipType = getenv('IPADDRESS_TYPE');
+}
 
 $options = [
     'configMapNamespace' => $controllerNamespace,
